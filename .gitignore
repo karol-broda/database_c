@@ -1,0 +1,12 @@
+# build artifacts
+build/
+bin/
+
+# database files
+*.db
+*.log
+
+# system files
+.DS_Store
+*.swp
+*.tmp
