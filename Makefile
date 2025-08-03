@@ -14,7 +14,7 @@ TARGET = $(BIN_DIR)/c_database
 
 TEST_SRCS = $(wildcard tests/*.c)
 TEST_OBJS = $(TEST_SRCS:tests/%.c=$(BUILD_DIR)/%.o)
-TEST_TARGET = $(BIN_DIR)/test_runner
+TEST_TARGET = $(BIN_DIR)/test_btree
 
 all: $(TARGET)
 

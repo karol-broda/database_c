@@ -89,7 +89,7 @@ void db_close(Database* db) {
 Result* db_execute(Database* db, const char* query) {
     if (strncmp(query, "BEGIN", 5) == 0) {
         if (db->locked) {
-            fprintf(stderr, "Error: Another transaction is already in progress.\n");
+            fprintf(stderr, "error: another transaction is already in progress.\n");
             return NULL;
         }
         db->locked = 1;
@@ -98,7 +98,7 @@ Result* db_execute(Database* db, const char* query) {
         return NULL;
     } else if (strncmp(query, "COMMIT", 6) == 0) {
         if (!db->locked) {
-            fprintf(stderr, "Error: No active transaction to commit.\n");
+            fprintf(stderr, "error: no active transaction to commit.\n");
             return NULL;
         }
         wal_log_commit(db->wal, db->current_tx_id);
@@ -107,7 +107,7 @@ Result* db_execute(Database* db, const char* query) {
         return NULL;
     } else if (strncmp(query, "ROLLBACK", 8) == 0) {
         if (!db->locked) {
-            fprintf(stderr, "Error: No active transaction to rollback.\n");
+            fprintf(stderr, "error: no active transaction to rollback.\n");
             return NULL;
         }
         // rollback by reinitializing buffer pool
@@ -125,20 +125,20 @@ Result* db_execute(Database* db, const char* query) {
         memcpy(db->catalog, catalog_page->data, sizeof(Catalog));
         buffer_pool_unpin_page(db->pool, db->pager, 1, 0);
         
-        // recover all tables, not just the root page
+        // recover only committed transactions, excluding the current one being rolled back
         for (int i = 0; i < db->catalog->num_tables; i++) {
-            wal_recover(db->pool, db->pager, db->wal, db->catalog->tables[i].root_page_id);
+            wal_apply_committed_transactions(db->pool, db->pager, db->catalog->tables[i].root_page_id, db->current_tx_id);
         }
 
         if (db->pager == NULL || db->pool == NULL) {
-            fprintf(stderr, "Error during rollback: Failed to re-initialize database components.\n");
+            fprintf(stderr, "error during rollback: failed to re-initialize database components.\n");
             exit(EXIT_FAILURE);
         }
         db->locked = 0;
         return NULL;
     } else if (strncmp(query, "CREATE TABLE", 12) == 0) {
         if (db->locked) {
-            fprintf(stderr, "Error: CREATE TABLE statements must not be within a transaction.\n");
+            fprintf(stderr, "error: create table statements must not be within a transaction.\n");
             return NULL;
         }
         char table_name[MAX_NAME_LEN];
@@ -147,7 +147,7 @@ Result* db_execute(Database* db, const char* query) {
         // find the opening parenthesis
         char* start = strchr(query, '(');
         if (start == NULL) {
-            fprintf(stderr, "Error: Invalid CREATE TABLE syntax.\n");
+            fprintf(stderr, "error: invalid create table syntax.\n");
             return NULL;
         }
         start++; // skip the opening parenthesis
@@ -155,7 +155,7 @@ Result* db_execute(Database* db, const char* query) {
         // find the matching closing parenthesis
         char* end = strrchr(query, ')');
         if (end == NULL || end <= start) {
-            fprintf(stderr, "Error: Invalid CREATE TABLE syntax.\n");
+            fprintf(stderr, "error: invalid create table syntax.\n");
             return NULL;
         }
         
@@ -165,7 +165,7 @@ Result* db_execute(Database* db, const char* query) {
         // extract column definitions
         int len = end - start;
         if (len >= 256) {
-            fprintf(stderr, "Error: Column definitions too long.\n");
+            fprintf(stderr, "error: column definitions too long.\n");
             return NULL;
         }
         strncpy(column_defs, start, len);
@@ -196,6 +196,24 @@ Result* db_execute(Database* db, const char* query) {
             } else if (strncmp(col_type, "VARCHAR", 7) == 0) {
                 sscanf(col_type, "VARCHAR(%hu)", &new_column.length);
                 new_column.type = COLUMN_TYPE_VARCHAR;
+            } else if (strcmp(col_type, "FLOAT") == 0) {
+                new_column.type = COLUMN_TYPE_FLOAT;
+                new_column.length = 0;
+            } else if (strcmp(col_type, "DOUBLE") == 0) {
+                new_column.type = COLUMN_TYPE_DOUBLE;
+                new_column.length = 0;
+            } else if (strcmp(col_type, "TEXT") == 0) {
+                new_column.type = COLUMN_TYPE_TEXT;
+                new_column.length = 0;
+            } else if (strcmp(col_type, "DATE") == 0) {
+                new_column.type = COLUMN_TYPE_DATE;
+                new_column.length = 0;
+            } else if (strcmp(col_type, "TIMESTAMP") == 0) {
+                new_column.type = COLUMN_TYPE_TIMESTAMP;
+                new_column.length = 0;
+            } else if (strcmp(col_type, "BOOLEAN") == 0) {
+                new_column.type = COLUMN_TYPE_BOOLEAN;
+                new_column.length = 0;
             }
             new_column.is_primary_key = (strstr(token, "PRIMARY KEY") != NULL);
 
@@ -215,19 +233,23 @@ Result* db_execute(Database* db, const char* query) {
             root_node->next_leaf = 0;
             db->pager->next_page_id++;
             buffer_pool_unpin_page(db->pool, db->pager, new_table.root_page_id, 1);
+            
+            // save updated catalog to disk
+            Page* catalog_page = buffer_pool_get_page(db->pool, db->pager, 1);
+            memcpy(catalog_page->data, db->catalog, sizeof(Catalog));
+            buffer_pool_unpin_page(db->pool, db->pager, 1, 1);
         } else {
-            fprintf(stderr, "Error: Maximum number of tables reached.\n");
+            fprintf(stderr, "error: maximum number of tables reached.\n");
         }
         return NULL;
     } else if (strncmp(query, "INSERT INTO", 11) == 0) {
         if (!db->locked) {
-            fprintf(stderr, "Error: INSERT statements must be within a transaction.\n");
+            fprintf(stderr, "error: insert statements must be within a transaction.\n");
             return NULL;
         }
         char table_name[MAX_NAME_LEN];
-        int id;
-        char name[256];
-        sscanf(query, "INSERT INTO %s VALUES (%d, '%[^']')", table_name, &id, name);
+        char values[256];
+        sscanf(query, "INSERT INTO %s VALUES (%[^)]s)", table_name, values);
 
         uint32_t table_root_page_id = 0;
         for (int i = 0; i < db->catalog->num_tables; i++) {
@@ -238,22 +260,48 @@ Result* db_execute(Database* db, const char* query) {
         }
 
         if (table_root_page_id == 0) {
-            fprintf(stderr, "Error: Table %s not found.\n", table_name);
+            fprintf(stderr, "error: table %s not found.\n", table_name);
             return NULL;
         }
 
-        wal_log_insert(db->wal, db->current_tx_id, id, name);
-        btree_insert(db->pool, db->pager, table_root_page_id, id, name, db->locked);
+        int id;
+        char serialized_values[256] = "";
+        char* token = strtok(values, ",");
+        int first = 1;
+        while (token != NULL) {
+            // trim leading/trailing whitespace and quotes
+            while (*token == ' ' || *token == '\t' || *token == '\'') {
+                token++;
+            }
+            char* end = token + strlen(token) - 1;
+            while (end > token && (*end == ' ' || *end == '\t' || *end == '\'')) {
+                *end-- = '\0';
+            }
+            if (first) {
+                id = atoi(token);
+                first = 0;
+            }
+            strcat(serialized_values, token);
+            strcat(serialized_values, "|");
+            token = strtok(NULL, ",");
+        }
+        // remove trailing delimiter
+        if (strlen(serialized_values) > 0) {
+            serialized_values[strlen(serialized_values) - 1] = '\0';
+        }
+
+        wal_log_insert(db->wal, db->current_tx_id, id, serialized_values);
+        btree_insert(db->pool, db->pager, table_root_page_id, id, serialized_values, db->locked);
         return NULL;
     } else if (strncmp(query, "UPDATE", 6) == 0) {
         if (!db->locked) {
-            fprintf(stderr, "Error: UPDATE statements must be within a transaction.\n");
+            fprintf(stderr, "error: update statements must be within a transaction.\n");
             return NULL;
         }
         char table_name[MAX_NAME_LEN];
         int id;
-        char name[256];
-        sscanf(query, "UPDATE %s SET name = '%[^']' WHERE id = %d", table_name, name, &id);
+        char set_clause[256];
+        sscanf(query, "UPDATE %s SET %[^WHERE]s WHERE id = %d", table_name, set_clause, &id);
 
         uint32_t table_root_page_id = 0;
         for (int i = 0; i < db->catalog->num_tables; i++) {
@@ -264,16 +312,34 @@ Result* db_execute(Database* db, const char* query) {
         }
 
         if (table_root_page_id == 0) {
-            fprintf(stderr, "Error: Table %s not found.\n", table_name);
+            fprintf(stderr, "error: table %s not found.\n", table_name);
             return NULL;
         }
 
-        wal_log_update(db->wal, db->current_tx_id, id, name);
-        btree_insert(db->pool, db->pager, table_root_page_id, id, name, db->locked);
+        char* value = strchr(set_clause, '=');
+        if (value == NULL) {
+            fprintf(stderr, "error: invalid update syntax.\n");
+            return NULL;
+        }
+        value++; // skip the '='
+        // trim leading/trailing whitespace and quotes
+        while (*value == ' ' || *value == '\t' || *value == '\'') {
+            value++;
+        }
+        char* end = value + strlen(value) - 1;
+        while (end > value && (*end == ' ' || *end == '\t' || *end == '\'')) {
+            *end-- = '\0';
+        }
+
+        char serialized_values[256];
+        sprintf(serialized_values, "%d|%s", id, value);
+
+        wal_log_update(db->wal, db->current_tx_id, id, serialized_values);
+        btree_insert(db->pool, db->pager, table_root_page_id, id, serialized_values, db->locked);
         return NULL;
     } else if (strncmp(query, "DELETE FROM", 11) == 0) {
         if (!db->locked) {
-            fprintf(stderr, "Error: DELETE statements must be within a transaction.\n");
+            fprintf(stderr, "error: delete statements must be within a transaction.\n");
             return NULL;
         }
         char table_name[MAX_NAME_LEN];
@@ -289,7 +355,7 @@ Result* db_execute(Database* db, const char* query) {
         }
 
         if (table_root_page_id == 0) {
-            fprintf(stderr, "Error: Table %s not found.\n", table_name);
+            fprintf(stderr, "error: table %s not found.\n", table_name);
             return NULL;
         }
 
@@ -303,29 +369,46 @@ Result* db_execute(Database* db, const char* query) {
         }
 
         char table_name[MAX_NAME_LEN];
-        int id_present = 0;
-        int id_value = 0;
-        char op[4] = "";
-
-        if (sscanf(query, "SELECT * FROM %s WHERE id %s %d", table_name, op, &id_value) == 3) {
-            id_present = 1;
-        } else if (sscanf(query, "SELECT * FROM %s", table_name) == 1) {
-            // no where clause
-        } else {
-            fprintf(stderr, "Error: Invalid SELECT query format.\n");
+        char where_clause[256] = "";
+        
+        // extract table name first
+        char* from_pos = strstr(query, "FROM");
+        if (from_pos == NULL) {
+            fprintf(stderr, "error: invalid select query format.\n");
             return NULL;
         }
+        from_pos += 5; // skip "FROM "
+        
+        // find the end of table name (either space, WHERE, or end of string)
+        char* where_pos = strstr(from_pos, "WHERE");
+        if (where_pos != NULL) {
+            // extract table name up to WHERE
+            int table_name_len = where_pos - from_pos;
+            strncpy(table_name, from_pos, table_name_len);
+            table_name[table_name_len] = '\0';
+            // trim trailing spaces
+            while (table_name_len > 0 && table_name[table_name_len - 1] == ' ') {
+                table_name[--table_name_len] = '\0';
+            }
+            // extract where clause
+            strcpy(where_clause, where_pos + 6); // skip "WHERE "
+        } else {
+            // no WHERE clause, extract table name to end of query
+            sscanf(from_pos, "%s", table_name);
+        }
+        
 
-        uint32_t table_root_page_id = 0;
+
+        TableSchema* table = NULL;
         for (int i = 0; i < db->catalog->num_tables; i++) {
             if (strcmp(db->catalog->tables[i].table_name, table_name) == 0) {
-                table_root_page_id = db->catalog->tables[i].root_page_id;
+                table = &db->catalog->tables[i];
                 break;
             }
         }
 
-        if (table_root_page_id == 0) {
-            fprintf(stderr, "Error: Table %s not found.\n", table_name);
+        if (table == NULL) {
+            fprintf(stderr, "error: table %s not found.\n", table_name);
             return NULL;
         }
 
@@ -334,35 +417,80 @@ Result* db_execute(Database* db, const char* query) {
         result->rows = NULL;
 
         // start from the leftmost leaf node (assumes root is leaf)
-        uint32_t current_page_id = table_root_page_id;
+        uint32_t current_page_id = table->root_page_id;
         Page* current_page = buffer_pool_get_page(db->pool, db->pager, current_page_id);
         BTreeLeafNode* leaf_node = (BTreeLeafNode*)current_page;
         while (leaf_node != NULL) {
             for (int i = 0; i < leaf_node->header.num_keys; i++) {
                 if (leaf_node->keys[i] == -1) continue; // skip deleted keys
-                int matches_condition = 1;
-                if (id_present) {
-                    if (strcmp(op, "=") == 0) {
-                        if (leaf_node->keys[i] != id_value) matches_condition = 0;
-                    } else if (strcmp(op, "<") == 0) {
-                        if (leaf_node->keys[i] >= id_value) matches_condition = 0;
-                    } else if (strcmp(op, ">") == 0) {
-                        if (leaf_node->keys[i] <= id_value) matches_condition = 0;
-                    } else if (strcmp(op, "<=") == 0) {
-                        if (leaf_node->keys[i] > id_value) matches_condition = 0;
-                    } else if (strcmp(op, ">=") == 0) {
-                        if (leaf_node->keys[i] < id_value) matches_condition = 0;
+
+                int matches = 1;
+                if (strlen(where_clause) > 0) {
+                    char col_name[MAX_NAME_LEN];
+                    char op[4];
+                    char value_str[256];
+                    sscanf(where_clause, "%s %s %s", col_name, op, value_str);
+
+                    int col_idx = -1;
+                    for (int j = 0; j < table->num_columns; j++) {
+                        if (strcmp(table->columns[j].name, col_name) == 0) {
+                            col_idx = j;
+                            break;
+                        }
+                    }
+
+                    if (col_idx != -1) {
+                        char* value_copy = strdup(leaf_node->values[i]);
+                        char* token = strtok(value_copy, "|");
+                        int col = 0;
+                        char* cell_value = NULL;
+                        while (token != NULL && col <= col_idx) {
+                            if (col == col_idx) {
+                                cell_value = token;
+                                break;
+                            }
+                            token = strtok(NULL, "|");
+                            col++;
+                        }
+
+                        if (cell_value != NULL) {
+                            if (strcmp(op, "=") == 0) {
+                                if (strcmp(cell_value, value_str) != 0) matches = 0;
+                            } else if (strcmp(op, "!=") == 0) {
+                                if (strcmp(cell_value, value_str) == 0) matches = 0;
+                            } else if (strcmp(op, "<") == 0) {
+                                if (atof(cell_value) >= atof(value_str)) matches = 0;
+                            } else if (strcmp(op, ">") == 0) {
+                                if (atof(cell_value) <= atof(value_str)) matches = 0;
+                            } else if (strcmp(op, "<=") == 0) {
+                                if (atof(cell_value) > atof(value_str)) matches = 0;
+                            } else if (strcmp(op, ">=") == 0) {
+                                if (atof(cell_value) < atof(value_str)) matches = 0;
+                            }
+                        } else {
+                            matches = 0;
+                        }
+                        free(value_copy);
+                    } else {
+                        matches = 0;
                     }
                 }
 
-                if (matches_condition) {
+                if (matches) {
                     result->num_rows++;
                     result->rows = (char***)realloc(result->rows, sizeof(char**) * result->num_rows);
-                    result->rows[result->num_rows - 1] = (char**)malloc(sizeof(char*) * 2);
-                    result->rows[result->num_rows - 1][0] = (char*)malloc(10);
-                    sprintf(result->rows[result->num_rows - 1][0], "%d", leaf_node->keys[i]);
-                    result->rows[result->num_rows - 1][1] = (char*)malloc(strlen(leaf_node->values[i]) + 1);
-                    strcpy(result->rows[result->num_rows - 1][1], leaf_node->values[i]);
+                    result->rows[result->num_rows - 1] = (char**)malloc(sizeof(char*) * table->num_columns);
+
+                    char* value_copy = strdup(leaf_node->values[i]);
+                    char* token = strtok(value_copy, "|");
+                    int col = 0;
+                    while (token != NULL && col < table->num_columns) {
+                        result->rows[result->num_rows - 1][col] = (char*)malloc(strlen(token) + 1);
+                        strcpy(result->rows[result->num_rows - 1][col], token);
+                        token = strtok(NULL, "|");
+                        col++;
+                    }
+                    free(value_copy);
                 }
             }
 
@@ -610,8 +738,7 @@ void table_printer_free(TablePrinter* printer) {
 void db_help(void) {
     printf("General\n");
     printf("  \\q                     quit database\n");
-    printf("  \\?                     show this help\n");
-    printf("  \\h                     show this help\n");
+    printf("  \\?  \\h                 show this help\n");
     printf("\n");
     printf("Informational\n");
     printf("  \\l                     list databases\n");
@@ -624,7 +751,7 @@ void db_help(void) {
 void db_list_databases(const char* filename) {
     TablePrinter* printer = table_printer_create("List of databases", 6);
     if (printer == NULL) {
-        printf("Error: Unable to create table printer.\n");
+        printf("error: unable to create table printer.\n");
         return;
     }
     
@@ -662,7 +789,7 @@ void db_list_tables(Database* db) {
     
     TablePrinter* printer = table_printer_create("List of relations", 4);
     if (printer == NULL) {
-        printf("Error: Unable to create table printer.\n");
+        printf("error: unable to create table printer.\n");
         return;
     }
     
@@ -687,7 +814,7 @@ void db_list_tables(Database* db) {
 
 void db_describe_table(Database* db, const char* table_name) {
     if (db == NULL || db->catalog == NULL || table_name == NULL) {
-        printf("Error: Invalid parameters.\n");
+        printf("error: invalid parameters.\n");
         return;
     }
 
@@ -700,7 +827,7 @@ void db_describe_table(Database* db, const char* table_name) {
     }
 
     if (table == NULL) {
-        printf("Did not find any relation named \"%s\".\n", table_name);
+        printf("did not find any relation named \"%s\".\n", table_name);
         return;
     }
 
@@ -709,7 +836,7 @@ void db_describe_table(Database* db, const char* table_name) {
     
     TablePrinter* printer = table_printer_create(title, 5);
     if (printer == NULL) {
-        printf("Error: Unable to create table printer.\n");
+        printf("error: unable to create table printer.\n");
         return;
     }
     
@@ -727,6 +854,18 @@ void db_describe_table(Database* db, const char* table_name) {
             strcpy(type_str, "integer");
         } else if (col->type == COLUMN_TYPE_VARCHAR) {
             snprintf(type_str, sizeof(type_str), "character varying(%d)", col->length);
+        } else if (col->type == COLUMN_TYPE_FLOAT) {
+            strcpy(type_str, "real");
+        } else if (col->type == COLUMN_TYPE_DOUBLE) {
+            strcpy(type_str, "double precision");
+        } else if (col->type == COLUMN_TYPE_TEXT) {
+            strcpy(type_str, "text");
+        } else if (col->type == COLUMN_TYPE_DATE) {
+            strcpy(type_str, "date");
+        } else if (col->type == COLUMN_TYPE_TIMESTAMP) {
+            strcpy(type_str, "timestamp");
+        } else if (col->type == COLUMN_TYPE_BOOLEAN) {
+            strcpy(type_str, "boolean");
         } else {
             strcpy(type_str, "unknown");
         }
@@ -768,7 +907,7 @@ void db_describe_all(Database* db) {
     
     TablePrinter* printer = table_printer_create("List of relations", 6);
     if (printer == NULL) {
-        printf("Error: Unable to create table printer.\n");
+        printf("error: unable to create table printer.\n");
         return;
     }
     
