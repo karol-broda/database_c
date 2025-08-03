@@ -5,6 +5,7 @@
 
 #define MAX_TABLES 16
 #define MAX_COLUMNS_PER_TABLE 16
+#define MAX_INDEXES_PER_TABLE 8
 #define MAX_NAME_LEN 64
 
 typedef enum {
@@ -25,11 +26,28 @@ typedef struct {
     int is_primary_key;
 } ColumnSchema;
 
+typedef enum {
+    INDEX_TYPE_BTREE,
+    INDEX_TYPE_HASH // for future
+} IndexType;
+
+typedef struct {
+    char name[MAX_NAME_LEN];
+    char table_name[MAX_NAME_LEN];
+    char column_name[MAX_NAME_LEN];
+    IndexType type;
+    uint32_t root_page_id;
+    int is_unique;
+    int is_primary;
+} IndexSchema;
+
 typedef struct {
     char table_name[MAX_NAME_LEN];
     uint32_t root_page_id;
     uint16_t num_columns;
     ColumnSchema columns[MAX_COLUMNS_PER_TABLE];
+    uint16_t num_indexes;
+    IndexSchema indexes[MAX_INDEXES_PER_TABLE];
 } TableSchema;
 
 typedef struct {

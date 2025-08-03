@@ -14,7 +14,9 @@ TARGET = $(BIN_DIR)/c_database
 
 TEST_SRCS = $(wildcard tests/*.c)
 TEST_OBJS = $(TEST_SRCS:tests/%.c=$(BUILD_DIR)/%.o)
-TEST_TARGET = $(BIN_DIR)/test_btree
+TEST_BTREE_TARGET = $(BIN_DIR)/test_btree
+TEST_INDEXES_TARGET = $(BIN_DIR)/test_indexes
+TEST_INTEGRATION_TARGET = $(BIN_DIR)/test_integration
 
 all: $(TARGET)
 
@@ -31,13 +33,30 @@ $(BUILD_DIR)/%.o: src/%.c | $(BUILD_DIR)
 $(BUILD_DIR)/%.o: tests/%.c | $(BUILD_DIR)
 	$(CC) $(CFLAGS) -c $< -o $@
 
-test: $(TEST_TARGET)
-	./$(TEST_TARGET)
+test: test-btree test-indexes test-integration
 
-$(TEST_TARGET): $(filter-out $(BUILD_DIR)/main.o,$(OBJS)) $(TEST_OBJS) | $(BIN_DIR)
+test-btree: $(TEST_BTREE_TARGET)
+	@echo "Running B-tree tests..."
+	./$(TEST_BTREE_TARGET)
+
+test-indexes: $(TEST_INDEXES_TARGET)
+	@echo "Running index tests..."
+	./$(TEST_INDEXES_TARGET)
+
+test-integration: $(TEST_INTEGRATION_TARGET)
+	@echo "Running integration tests..."
+	./$(TEST_INTEGRATION_TARGET)
+
+$(TEST_BTREE_TARGET): $(filter-out $(BUILD_DIR)/main.o,$(OBJS)) $(BUILD_DIR)/test_btree.o | $(BIN_DIR)
+	$(CC) $(CFLAGS) -o $@ $^ $(LDFLAGS)
+
+$(TEST_INDEXES_TARGET): $(filter-out $(BUILD_DIR)/main.o,$(OBJS)) $(BUILD_DIR)/test_indexes.o | $(BIN_DIR)
+	$(CC) $(CFLAGS) -o $@ $^ $(LDFLAGS)
+
+$(TEST_INTEGRATION_TARGET): $(filter-out $(BUILD_DIR)/main.o,$(OBJS)) $(BUILD_DIR)/test_integration.o | $(BIN_DIR)
 	$(CC) $(CFLAGS) -o $@ $^ $(LDFLAGS)
 
 clean:
 	rm -rf $(BUILD_DIR) $(BIN_DIR) *.db *.log
 
-.PHONY: all clean test
+.PHONY: all clean test test-btree test-indexes test-integration
